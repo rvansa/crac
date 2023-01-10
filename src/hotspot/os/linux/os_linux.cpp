@@ -5746,9 +5746,48 @@ void VM_Crac::print_resources(const char* msg, ...) {
   }
 }
 
+static int is_process_traced() {
+  FILE *status = fopen("/proc/self/status", "r");
+  if (!stat) {
+    tty->print("CRaC cannot check process status!\n");
+    perror("fopen /proc/self/status");
+    return -1;
+  }
+
+  constexpr int BUFFER_SIZE = 256;
+  char line[BUFFER_SIZE];
+  while (fgets(line, BUFFER_SIZE, status)) {
+    if (!strncmp("TracerPid:", line, 10)) {
+      for (char *c = line + 10; c - line < BUFFER_SIZE && *c; ++c) {
+        if (*c == ' ' || *c == '\t') {
+          // skip whitespaces
+        } else if (*c == '0' || *c == '\n') {
+          // TracePid: 0 means not traced, OK!
+        } else {
+          char *newline = strchr(c, '\n');
+          if (newline) {
+            *newline = '\0';
+          }
+          int pid = atoi(c);
+          fclose(status);
+          return pid == 0 ? -1 : pid;
+        }
+      }
+    }
+  }
+
+  fclose(status);
+  return 0;
+}
+
 void os::Linux::vm_create_start() {
   if (!CRaCCheckpointTo) {
     return;
+  }
+  int tracer_pid = is_process_traced();
+  if (tracer_pid != 0) {
+    tty->print("This process is being traced by PID %d; CRIU cannot checkpoint this process.\n", tracer_pid);
+    exit(1);
   }
   close_extra_descriptors();
   _vm_inited_fds.initialize();
@@ -6197,6 +6236,12 @@ void VM_Crac::doit() {
 
   // dry-run fails checkpoint
   bool ok = !_dry_run;
+
+  int tracer_id = is_process_traced();
+  if (tracer_id != 0) {
+    tty->print("This process is being traced by pid %d and cannot be checkpointed.\n", tracer_id);
+    return;
+  }
 
   for (int i = 0; i < fds.len(); ++i) {
     if (fds.get_state(i) == FdsInfo::CLOSED) {
