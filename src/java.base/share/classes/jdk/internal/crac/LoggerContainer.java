@@ -17,6 +17,10 @@ public class LoggerContainer {
         logger.log(System.Logger.Level.DEBUG, fmt, params);
     }
 
+    public static void warn(String msg) {
+        logger.log(System.Logger.Level.WARNING, msg);
+    }
+
     private LoggerContainer() {}
 
     public static void error(String msg) {

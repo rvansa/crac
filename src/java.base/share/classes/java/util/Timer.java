@@ -24,9 +24,14 @@
  */
 
 package java.util;
-import java.util.Date;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.lang.ref.Cleaner.Cleanable;
+
+import jdk.crac.Context;
+import jdk.crac.Resource;
+import jdk.crac.TimerPolicy;
+import jdk.internal.crac.Core;
+import jdk.internal.crac.JDKResource;
 import jdk.internal.ref.CleanerFactory;
 
 /**
@@ -533,7 +538,7 @@ class TimerThread extends Thread {
                 boolean taskFired;
                 synchronized(queue) {
                     // Wait for queue to become non-empty
-                    while (queue.isEmpty() && newTasksMayBeScheduled)
+                    while (queue.isSuspended() || (queue.isEmpty() && newTasksMayBeScheduled))
                         queue.wait();
                     if (queue.isEmpty())
                         break; // Queue is empty and will forever remain; die
@@ -577,7 +582,7 @@ class TimerThread extends Thread {
  * offers log(n) performance for the add, removeMin and rescheduleMin
  * operations, and constant time performance for the getMin operation.
  */
-class TaskQueue {
+class TaskQueue implements JDKResource {
     /**
      * Priority queue represented as a balanced binary heap: the two children
      * of queue[n] are queue[2*n] and queue[2*n+1].  The priority queue is
@@ -587,6 +592,11 @@ class TaskQueue {
      * n.nextExecutionTime <= d.nextExecutionTime.
      */
     private TimerTask[] queue = new TimerTask[128];
+
+    /**
+     * Set to non-zero value until {@link #afterRestore(Context)}.
+     */
+    private long checkpointMillis;
 
     /**
      * The number of tasks in the priority queue.  (The tasks are stored in
@@ -601,6 +611,10 @@ class TaskQueue {
         return size;
     }
 
+    TaskQueue() {
+        Core.getJDKContext().register(this);
+    }
+
     /**
      * Adds a new task to the priority queue.
      */
@@ -611,6 +625,13 @@ class TaskQueue {
 
         queue[++size] = task;
         fixUp(size);
+    }
+
+    /**
+     * Checks if the timer is suspended between Checkpoint and Restore
+     */
+    boolean isSuspended() {
+        return checkpointMillis != 0;
     }
 
     /**
@@ -727,5 +748,52 @@ class TaskQueue {
     void heapify() {
         for (int i = size/2; i >= 1; i--)
             fixDown(i);
+    }
+
+    @Override
+    public synchronized void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+        checkpointMillis = System.currentTimeMillis();
+    }
+
+    @Override
+    public synchronized void afterRestore(Context<? extends Resource> context) throws Exception {
+        try {
+            switch (TimerPolicy.POLICY) {
+                case DEFAULT:
+                    break;
+                case CANCEL:
+                    for (int i = 1; i <= size; ++i) {
+                        queue[i].cancel();
+                        queue[i] = null;
+                    }
+                    size = 0;
+                    break;
+                case SKIP_TIME:
+                    long snapshotDuration = System.currentTimeMillis() - checkpointMillis;
+                    for (int i = 1; i <= size; ++i) {
+                        queue[i].nextExecutionTime += snapshotDuration;
+                    }
+                    break;
+                case SKIP_EXECUTIONS:
+                    long now = System.currentTimeMillis();
+                    for (int i = 1; i <= size; ++i) {
+                        TimerTask task = queue[i];
+                        if (task.period > 0 && task.nextExecutionTime < now) {
+                            task.nextExecutionTime += ((now - task.nextExecutionTime) / task.period) * task.period;
+                        }
+                    }
+                    break;
+                default:
+                    throw new IllegalStateException("Unknown policy " + TimerPolicy.POLICY);
+            }
+        } finally {
+            checkpointMillis = 0;
+            notify();
+        }
+    }
+
+    @Override
+    public Priority getPriority() {
+        return Priority.NORMAL;
     }
 }

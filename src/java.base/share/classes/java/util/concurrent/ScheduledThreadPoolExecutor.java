@@ -35,6 +35,13 @@
 
 package java.util.concurrent;
 
+import jdk.crac.Context;
+import jdk.crac.Resource;
+import jdk.crac.TimerPolicy;
+import jdk.internal.crac.Core;
+import jdk.internal.crac.JDKResource;
+import jdk.internal.crac.LoggerContainer;
+
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
@@ -928,6 +935,8 @@ public class ScheduledThreadPoolExecutor
         private final ReentrantLock lock = new ReentrantLock();
         private int size;
 
+        private final SnapshotResource resource = new SnapshotResource();
+
         /**
          * Thread designated to wait for the task at the head of the
          * queue.  This variant of the Leader-Follower pattern
@@ -1344,6 +1353,84 @@ public class ScheduledThreadPoolExecutor
                     throw new IllegalStateException();
                 DelayedWorkQueue.this.remove(array[lastRet]);
                 lastRet = -1;
+            }
+        }
+
+        private class SnapshotResource implements JDKResource {
+            // For simplicity, we'll use times when this resource was notified.
+            private long checkpointNanos;
+
+            public SnapshotResource() {
+                Core.getJDKContext().register(this);
+            }
+
+            @Override
+            public void beforeCheckpoint(Context<? extends Resource> context) throws Exception {
+                // We will lock the queue during checkpoint anyway as we don't know
+                // what policy will there be after restore
+                DelayedWorkQueue.this.lock.lock();
+                checkpointNanos = System.nanoTime();
+            }
+
+            @Override
+            public void afterRestore(Context<? extends Resource> context) throws Exception {
+                try {
+                    if (size == 0) {
+                        return;
+                    }
+                    switch (TimerPolicy.POLICY) {
+                        case DEFAULT:
+                            break;
+                        case CANCEL:
+                            RunnableScheduledFuture<?>[] tasks = Arrays.copyOf(queue, size);
+                            clear();
+                            for (var task : tasks) {
+                                if (task != null) {
+                                    task.cancel(false);
+                                }
+                            }
+                            break;
+                        case SKIP_TIME:
+                            long snapshotDuration = System.nanoTime() - checkpointNanos;
+                            for (RunnableScheduledFuture<?> task : queue) {
+                                if (task instanceof ScheduledFutureTask) {
+                                    ((ScheduledFutureTask<?>) task).time += snapshotDuration;
+                                } else if (task == null) {
+                                    break;
+                                } else {
+                                    LoggerContainer.warn("Cannot update timer time for " + task);
+                                }
+                            }
+                            break;
+                        case SKIP_EXECUTIONS:
+                            long now = System.nanoTime();
+                            for (RunnableScheduledFuture<?> task : queue) {
+                                if (task == null) {
+                                    break; // we're past last task
+                                } else if (!task.isPeriodic()) {
+                                    // ignore non-periodic tasks
+                                } else if (task instanceof ScheduledFutureTask) {
+                                    ScheduledFutureTask<?> sft = (ScheduledFutureTask<?>) task;
+                                    if (sft.period > 0 && sft.time < now) {
+                                        sft.time += ((now - sft.time) / sft.period) * sft.period;
+                                    }
+                                } else if (task.getDelay(NANOSECONDS) >= 0) {
+                                    LoggerContainer.warn("Cannot update timer time for " + task);
+                                }
+                            }
+                            break;
+                        default:
+                            throw new IllegalStateException("Unknown policy " + TimerPolicy.POLICY);
+                    }
+                } finally {
+                    DelayedWorkQueue.this.available.signal();
+                    DelayedWorkQueue.this.lock.unlock();
+                }
+            }
+
+            @Override
+            public Priority getPriority() {
+                return Priority.NORMAL;
             }
         }
     }

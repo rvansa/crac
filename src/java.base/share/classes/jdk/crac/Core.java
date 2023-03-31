@@ -173,11 +173,16 @@ public class Core {
         }
 
         if (newProperties != null && newProperties.length > 0) {
-            Arrays.stream(newProperties).map(propStr -> propStr.split("=", 2)).forEach(pair -> {
+            for (String propStr : newProperties) {
+                String[] pair = propStr.split("=", 2);
                 AccessController.doPrivileged(
-                    (PrivilegedAction<String>)() ->
-                        System.setProperty(pair[0], pair.length == 2 ? pair[1] : ""));
-            });
+                        new PrivilegedAction<String>() {
+                            @Override
+                            public String run() {
+                                return System.setProperty(pair[0], pair.length == 2 ? pair[1] : "");
+                            }
+                        });
+            }
         }
 
         RestoreException restoreException = null;
