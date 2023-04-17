@@ -390,6 +390,10 @@ class EPollSelectorImpl extends SelectorImpl implements JDKResource {
                 }
             }
             if (checkpointState == CheckpointRestoreState.CHECKPOINT_ERROR) {
+                // The context won't call afterRestore after exception is thrown, we need
+                // to unblock the threads invoking processCheckpointRestore here
+                checkpointState = CheckpointRestoreState.NORMAL_OPERATION;
+                interruptLock.notifyAll();
                 throw new IllegalSelectorException();
             }
         }
