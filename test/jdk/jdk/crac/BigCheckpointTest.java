@@ -24,6 +24,7 @@
  */
 
 import jdk.crac.Core;
+import jdk.test.lib.containers.docker.Common;
 import jdk.test.lib.crac.CracBuilder;
 import jdk.test.lib.crac.CracTest;
 
@@ -49,12 +50,21 @@ import java.util.stream.Stream;
  * @run driver jdk.test.lib.crac.CracTest
  */
 public class BigCheckpointTest implements CracTest {
+    private static final String imageName = Common.imageName("big-checkpoint");
+
     @Override
     public void test() throws Exception {
-        new CracBuilder().vmOption("-Xlog:gc,gc+heap,gc+heap+exit,gc+ergo+heap=debug")
-//                .vmOption("-XX:+UseZGC")
-                .vmOption("-XX:MinHeapFreeRatio=10").vmOption("-XX:MaxHeapFreeRatio=20").doCheckpoint();
-        new CracBuilder().doRestore();
+        CracBuilder builder = new CracBuilder()
+                .inDockerImage(imageName)
+                .vmOption("-Xlog:gc,gc+heap,gc+heap+exit,gc+ergo+heap=debug")
+                .vmOption("-XX:MinHeapFreeRatio=10").vmOption("-XX:MaxHeapFreeRatio=20");
+        try {
+            builder.doCheckpoint();
+            builder.clearVmOptions();
+            builder.doRestore();
+        } finally {
+            builder.ensureContainerKilled();
+        }
     }
 
     @Override
@@ -80,11 +90,11 @@ public class BigCheckpointTest implements CracTest {
             }
         }).sum();
         System.out.printf("Checkpoint size: %d MB%n", checkpointSize >> 20);
-        System.out.printf("Pages size before fallocate: ");
-        new ProcessBuilder().inheritIO().command("du", "-B", "1", "cr/pages-1.img").start().waitFor();
-        Runtime.getRuntime().exec("sudo fallocate -d cr/pages-1.img").waitFor();
-        System.out.printf("Pages size after fallocate -d: ");
-        new ProcessBuilder().inheritIO().command("du", "-B", "1", "cr/pages-1.img").start().waitFor();
+//        System.out.printf("Pages size before fallocate: ");
+//        new ProcessBuilder().inheritIO().command("du", "-B", "1", "cr/pages-1.img").start().waitFor();
+//        Runtime.getRuntime().exec("sudo fallocate -d cr/pages-1.img").waitFor();
+//        System.out.printf("Pages size after fallocate -d: ");
+//        new ProcessBuilder().inheritIO().command("du", "-B", "1", "cr/pages-1.img").start().waitFor();
 //        long start = System.nanoTime();
 //        Runtime.getRuntime().exec(new String[] { "bash", "-c", "tar czf - cr | gpg --cipher-algo aes256 --symmetric --batch --passphrase pa55w012d -o cr.tar.gz"}, null).waitFor();
 //        long stop = System.nanoTime();
