@@ -52,7 +52,7 @@ public class BigCheckpointTest implements CracTest {
     @Override
     public void test() throws Exception {
         new CracBuilder().vmOption("-Xlog:gc,gc+heap,gc+heap+exit,gc+ergo+heap=debug")
-                .vmOption("-XX:+UseZGC")
+//                .vmOption("-XX:+UseZGC")
                 .vmOption("-XX:MinHeapFreeRatio=10").vmOption("-XX:MaxHeapFreeRatio=20").doCheckpoint();
         new CracBuilder().doRestore();
     }
