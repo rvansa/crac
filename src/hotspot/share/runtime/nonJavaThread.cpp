@@ -114,7 +114,9 @@ void NonJavaThread::pre_run() {
 void NonJavaThread::post_run() {
   JFR_ONLY(Jfr::on_thread_exit(this);)
   remove_from_the_list();
-  unregister_thread_stack_with_NMT();
+  if (!has_custom_stack()) {
+    unregister_thread_stack_with_NMT();
+  }
   // Ensure thread-local-storage is cleared before termination.
   Thread::clear_thread_current();
   osthread()->set_state(ZOMBIE);

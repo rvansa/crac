@@ -91,6 +91,8 @@ Thread::Thread() {
   _nested_threads_hazard_ptr_cnt = 0;
   _rcu_counter = 0;
 
+  _custom_stack = false;
+
   // the handle mark links itself to last_handle_mark
   new HandleMark(this);
 

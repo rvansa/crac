@@ -1318,12 +1318,14 @@ public:
     _hrm.persist_for_checkpoint();
     _cm->persist_for_checkpoint();
     G1FromCardCache::persist_for_checkpoint();
+    _workers->suspend_workers();
     _task_queues->dealloc_queues();
   }
   void load_on_restore() {
     _hrm.load_on_restore();
     _cm->load_on_restore();
     G1FromCardCache::load_on_restore();
+    _workers->resume_workers();
     _task_queues->realloc_queues();
   }
 };

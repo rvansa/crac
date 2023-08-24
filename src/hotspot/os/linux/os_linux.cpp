@@ -897,43 +897,23 @@ static void init_adjust_stacksize_for_guard_pages() {
 }
 #endif // GLIBC
 
-bool os::create_thread(Thread* thread, ThreadType thr_type,
-                       size_t req_stack_size) {
-  assert(thread->osthread() == nullptr, "caller responsible");
-
-  // Allocate the OSThread object
-  OSThread* osthread = new (std::nothrow) OSThread();
-  if (osthread == nullptr) {
-    return false;
-  }
-
-  // set the correct thread state
-  osthread->set_thread_type(thr_type);
-
-  // Initial state is ALLOCATED but not INITIALIZED
-  osthread->set_state(ALLOCATED);
-
-  thread->set_osthread(osthread);
-
-  // init thread attributes
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
+size_t os::get_thread_stack_size(ThreadType thr_type, size_t req_stack_size) {
   // Calculate stack size if it's not specified by caller.
   size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
   size_t guard_size = os::Linux::default_guard_size(thr_type);
-
-  // Configure glibc guard page. Must happen before calling
-  // get_static_tls_area_size(), which uses the guard_size.
-  pthread_attr_setguardsize(&attr, guard_size);
 
   // Apply stack size adjustments if needed. However, be careful not to end up
   // with a size of zero due to overflow. Don't add the adjustment in that case.
   size_t stack_adjust_size = 0;
   if (AdjustStackSizeForTLS) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // Configure glibc guard page. Must happen before calling
+    // get_static_tls_area_size(), which uses the guard_size.
+    pthread_attr_setguardsize(&attr, guard_size);
     // Adjust the stack_size for on-stack TLS - see get_static_tls_area_size().
     stack_adjust_size += get_static_tls_area_size(&attr);
+    pthread_attr_destroy(&attr);
   } else if (os::Linux::adjustStackSizeForGuardPages()) {
     stack_adjust_size += guard_size;
   }
@@ -955,12 +935,53 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
       stack_size += os::vm_page_size();
     }
   }
+  return stack_size;
+}
 
-  int status = pthread_attr_setstacksize(&attr, stack_size);
+bool os::create_thread(Thread* thread, ThreadType thr_type,
+                       size_t req_stack_size, bool detached,
+                       void *stack_addr, size_t stack_size) {
+  assert(thread->osthread() == nullptr, "caller responsible");
+
+  // Allocate the OSThread object
+  OSThread* osthread = new (std::nothrow) OSThread();
+  if (osthread == nullptr) {
+    return false;
+  }
+
+  // set the correct thread state
+  osthread->set_thread_type(thr_type);
+
+  // Initial state is ALLOCATED but not INITIALIZED
+  osthread->set_state(ALLOCATED);
+
+  thread->set_osthread(osthread);
+
+  // init thread attributes
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, detached ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE);
+
+  // Configure glibc guard page. Must happen before calling
+  // get_static_tls_area_size(), which uses the guard_size.
+  pthread_attr_setguardsize(&attr, os::Linux::default_guard_size(thr_type));
+
+
+  int status;
+  if (stack_addr == nullptr) {
+    assert(stack_size == 0, "Expected stack size unset");
+    stack_size = get_thread_stack_size(thr_type, req_stack_size);
+    status = pthread_attr_setstacksize(&attr, stack_size);
+  } else {
+    guarantee(!detached, "Thread with custom stack must not be detached as the owner wouldn't know when to dealloc the stack");
+    assert(stack_size != 0, "Stack size should be set");
+    status = pthread_attr_setstack(&attr, stack_addr, stack_size);
+    thread->set_custom_stack();
+  }
   if (status != 0) {
     // pthread_attr_setstacksize() function can fail
     // if the stack size exceeds a system-imposed limit.
-    assert_status(status == EINVAL, status, "pthread_attr_setstacksize");
+    assert_status(status == EINVAL, status, stack_addr == NULL ? "pthread_attr_setstacksize" : "pthread_attr_setstack");
     log_warning(os, thread)("The %sthread stack size specified is invalid: " SIZE_FORMAT "k",
                             (thr_type == compiler_thread) ? "compiler " : ((thr_type == java_thread) ? "" : "VM "),
                             stack_size / K);
@@ -1032,6 +1053,11 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   // and is started higher up in the call chain
   assert(state == INITIALIZED, "race condition");
   return true;
+}
+
+void os::join_thread(void *os_id) {
+  int status = pthread_join(reinterpret_cast<pthread_t>(os_id), NULL);
+  guarantee(status == 0, "Failed to join thread: %s", os::strerror(errno));
 }
 
 /////////////////////////////////////////////////////////////////////////////

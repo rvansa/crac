@@ -31,6 +31,7 @@
 #include "runtime/init.hpp"
 #include "runtime/java.hpp"
 #include "runtime/os.hpp"
+#include "runtime/osThread.hpp"
 
 WorkerTaskDispatcher::WorkerTaskDispatcher() :
     _task(nullptr),
@@ -100,8 +101,16 @@ WorkerThread* WorkerThreads::create_worker(uint name_suffix) {
 
   WorkerThread* const worker = new WorkerThread(_name, name_suffix, &_dispatcher);
 
-  if (!os::create_thread(worker, os::gc_thread)) {
+  size_t stack_size = os::get_thread_stack_size(os::gc_thread);
+  char *stack_addr = os::reserve_memory(stack_size, false, mtThreadStack);
+  bool success = stack_addr != nullptr && os::commit_memory(stack_addr, stack_size, false);
+  success = success && os::create_thread(worker, os::gc_thread, 0, false, stack_addr, stack_size);
+
+  if (!success) {
     delete worker;
+    if (stack_addr != nullptr) {
+      os::release_memory(stack_addr, stack_size);
+    }
     return nullptr;
   }
 
@@ -182,17 +191,71 @@ void WorkerThreads::run_task(WorkerTask* task, uint num_workers) {
   run_task(task);
 }
 
+class TerminateWorkerTask: public WorkerTask {
+public:
+  TerminateWorkerTask(): WorkerTask("terminate-worker") {}
+
+  void work(uint worker_id) {
+    Thread *t = Thread::current();
+    assert(t->is_Worker_thread(), "Must be worker");
+    static_cast<WorkerThread *>(t)->stop();
+  }
+};
+
+void WorkerThreads::suspend_workers() {
+  log_trace(gc, task)("Suspending work gang %s with %u/%u threads",
+    name(), _created_workers, _max_workers);
+
+  ResourceMark rm;
+  struct threadinfo {
+    void *_os_id;
+    char *_stack_end;
+    size_t _stack_size;
+  };
+  struct threadinfo *worker_info = NEW_RESOURCE_ARRAY(struct threadinfo, _created_workers);
+  // When we send the terminate task the Thread instance is deallocated,
+  // hence we need to copy everything ahead;
+  for (uint i = 0; i < _created_workers; ++i) {
+    Thread *t = _workers[i];
+    worker_info[i] = {
+#ifdef LINUX
+      ._os_id = reinterpret_cast<void *>(t->osthread()->pthread_id()),
+#endif
+      ._stack_end = (char *) t->stack_end(),
+      ._stack_size = t->stack_size()
+    };
+  }
+
+  TerminateWorkerTask task;
+  _dispatcher.coordinator_distribute_task(&task, _created_workers);
+  for (uint i = 0; i < _created_workers; ++i) {
+    os::join_thread(worker_info[i]._os_id);
+    os::release_memory(worker_info[i]._stack_end, worker_info[i]._stack_size);
+    _workers[i] = NULL;
+  }
+
+  FREE_RESOURCE_ARRAY(struct threadinfo, worker_info, _created_workers);
+}
+
+void WorkerThreads::resume_workers() {
+  log_trace(gc, task)("Resuming work gang %s with %u threads", name(), _created_workers);
+  uint num_workers = _created_workers;
+  _created_workers = 0;
+  set_active_workers(num_workers);
+}
+
+
 THREAD_LOCAL uint WorkerThread::_worker_id = UINT_MAX;
 
 WorkerThread::WorkerThread(const char* name_prefix, uint name_suffix, WorkerTaskDispatcher* dispatcher) :
-    _dispatcher(dispatcher) {
+    _dispatcher(dispatcher), _stop(false) {
   set_name("%s#%u", name_prefix, name_suffix);
 }
 
 void WorkerThread::run() {
   os::set_priority(this, NearMaxPriority);
 
-  while (true) {
+  while (!_stop) {
     _dispatcher->worker_run_task();
   }
 }

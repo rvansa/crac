@@ -629,6 +629,12 @@ protected:
 #endif // __APPLE__ && AARCH64
 
  private:
+  bool _custom_stack;
+ public:
+  bool has_custom_stack() { return _custom_stack; }
+  void set_custom_stack() { _custom_stack = true; }
+
+ private:
   bool _in_asgct = false;
  public:
   bool in_asgct() const { return _in_asgct; }

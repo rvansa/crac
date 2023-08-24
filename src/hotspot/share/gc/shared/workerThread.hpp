@@ -119,6 +119,9 @@ public:
 
   // Run a task with the given number of workers, returns when the task is done.
   void run_task(WorkerTask* task, uint num_workers);
+
+  void suspend_workers();
+  void resume_workers();
 };
 
 class WorkerThread : public NamedThread {
@@ -128,6 +131,7 @@ private:
   static THREAD_LOCAL uint _worker_id;
 
   WorkerTaskDispatcher* const _dispatcher;
+  bool _stop;
 
   static void set_worker_id(uint worker_id) { _worker_id = worker_id; }
 
@@ -140,6 +144,18 @@ public:
   const char* type_name() const override { return "WorkerThread"; }
 
   void run() override;
+
+  void post_run() {
+    NamedThread::post_run();
+    // superclass must work on this instance but clears Thread::current
+    Thread::initialize_thread_current();
+    delete this;
+    // current thread cleared in Thread destructor
+  }
+
+  void stop() {
+    _stop = true;
+  }
 };
 
 // Temporarily try to set the number of active workers.

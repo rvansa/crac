@@ -541,9 +541,16 @@ class os: AllStatic {
     os_thread
   };
 
+  static size_t get_thread_stack_size(ThreadType thr_type, size_t req_stack_size = 0);
   static bool create_thread(Thread* thread,
                             ThreadType thr_type,
-                            size_t req_stack_size = 0);
+                            size_t req_stack_size = 0,
+                            bool detached = true,
+                            void *stack_addr = NULL,
+                            size_t stack_size = 0);
+  // FIXME: OSThread cannot be copied, and by the time we want to join
+  // the thread the Thread might be already deallocated.
+  static void join_thread(void *os_id);
 
   // The "main thread", also known as "starting thread", is the thread
   // that loads/creates the JVM via JNI_CreateJavaVM.
