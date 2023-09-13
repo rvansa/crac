@@ -50,6 +50,7 @@ static unsigned int _crengine_argc = 0;
 static const char* _crengine_args[32];
 static jlong _restore_start_time;
 static jlong _restore_start_nanos;
+static CracRestoreParameters _restore_parameters;
 
 // Timestamps recorded before checkpoint
 jlong crac::checkpoint_millis;
@@ -405,21 +406,15 @@ void VM_Crac::doit() {
       crac::MemoryPersister::finalize();
     }
     int ret = checkpoint_restore(&shmid);
-    if (CRPersistMemory) {
-      crac::MemoryPersister::load_on_restore();
-      restore_thread_stacks();
-#ifdef ASSERT
-      CodeCache::assert_checkpoint();
-#endif // ASSERT
-    }
     if (ret == JVM_CHECKPOINT_ERROR) {
+      if (CRPersistMemory) {
+        crac::MemoryPersister::load_on_restore();
+        restore_thread_stacks();
+      }
       memory_restore();
       return;
     }
   }
-
-  // It needs to check CPU features before any other code (such as VM_Crac::read_shm) depends on them.
-  VM_Version::crac_restore();
 
   if (shmid <= 0 || !VM_Crac::read_shm(shmid)) {
     _restore_start_time = os::javaTimeMillis();
@@ -428,7 +423,25 @@ void VM_Crac::doit() {
     _restore_start_nanos += crac::monotonic_time_offset();
   }
 
+  if (CRPersistMemory) {
+    if (CRProfileMemoryLoading) {
+#ifndef LINUX
+      tty->print_cr("Profiling of memory loading is currently supported only on Linux.");
+      os::exit(1);
+#else
+      crac::MemoryPersister::init_userfault();
+#endif
+    } else {
+      crac::MemoryPersister::load_on_restore();
+    }
+    restore_thread_stacks();
+#ifdef ASSERT
+    CodeCache::assert_checkpoint();
+#endif // ASSERT
+  }
+
   // VM_Crac::read_shm needs to be already called to read RESTORE_SETTABLE parameters.
+  VM_Version::crac_restore();
   VM_Version::crac_restore_finalize();
 
   memory_restore();
@@ -502,10 +515,10 @@ Handle crac::checkpoint(jarray fd_arr, jobjectArray obj_arr, bool dry_run, jlong
   }
   if (cr.ok()) {
     oop new_args = NULL;
-    if (cr.new_args()) {
-      new_args = java_lang_String::create_oop_from_str(cr.new_args(), CHECK_NH);
+    if (_restore_parameters.args()) {
+      new_args = java_lang_String::create_oop_from_str(_restore_parameters.args(), CHECK_NH);
     }
-    GrowableArray<const char *>* new_properties = cr.new_properties();
+    GrowableArray<const char *>* new_properties = _restore_parameters.properties();
     objArrayOop propsObj = oopFactory::new_objArray(vmClasses::String_klass(), new_properties->length(), CHECK_NH);
     objArrayHandle props(THREAD, propsObj);
 
@@ -680,6 +693,8 @@ GrowableArray<struct crac::MemoryPersister::record> crac::MemoryPersister::_inde
 int crac::MemoryPersister::_fd = -1;
 DEBUG_ONLY(bool crac::MemoryPersister::_loading = false;)
 size_t crac::MemoryPersister::_offset_curr = 0;
+int crac::MemoryPersister::_uffd = -1;
+int crac::MemoryPersister::_profile_fd = -1;
 
 void crac::MemoryPersister::ensure_open(bool loading) {
   // We don't need any synchronization as only the VM thread persists memory
@@ -689,7 +704,7 @@ void crac::MemoryPersister::ensure_open(bool loading) {
     return;
   }
   char path[PATH_MAX];
-  snprintf(path, PATH_MAX, "%s%smemory.img", CRaCCheckpointTo, os::file_separator());
+  snprintf(path, PATH_MAX, "%s%smemory.img", loading ? CRaCRestoreFrom : CRaCCheckpointTo, os::file_separator());
   _fd = os::open(path, loading ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC), S_IRUSR | S_IWUSR);
   if (_fd < 0) {
     fatal("Cannot open persisted memory file: %s", os::strerror(errno));
@@ -703,8 +718,6 @@ static bool is_all_zeroes(void *addr, size_t page_size) {
   while (ptr < end && *ptr == 0) ++ptr;
   return ptr == end;
 }
-
-#define BAD_OFFSET 0xFFFFFFFFBAD0FF5Eull
 
 bool crac::MemoryPersister::store(void *addr, size_t length, size_t mapped_length, bool executable) {
   if (mapped_length == 0) {
@@ -821,7 +834,7 @@ void crac::MemoryPersister::assert_mem(void *addr, size_t used, size_t total) {
   if (used > 0) {
     SearchInIndex comparator;
     bool found;
-    size_t at = (size_t) _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) addr }, found);
+    int at = _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) addr }, found);
     assert(found, "Cannot find region with address %p (%d records)", addr, _index.length());
     record &r = _index.at(at);
     assert(r.length == used, "Persisted memory region length does not match at %p: %lu vs. %lu", addr, used, r.length);
@@ -834,7 +847,7 @@ void crac::MemoryPersister::assert_mem(void *addr, size_t used, size_t total) {
   if (unused > 0) {
     SearchInIndex comparator;
     bool found;
-    size_t at = (size_t) _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) gap_addr }, found);
+    int at = _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) gap_addr }, found);
     assert(found, "Cannot find region with address %p (%d records)", addr, _index.length());
     record &r = _index.at(at);
     assert(r.length == unused, "Persisted gap length does not match at %p: %lu vs. %lu", gap_addr, unused, r.length);
@@ -846,11 +859,10 @@ void crac::MemoryPersister::assert_mem(void *addr, size_t used, size_t total) {
 void crac::MemoryPersister::assert_gap(void *addr, size_t length) {
   assert(((u_int64_t) addr & (os::vm_page_size() - 1)) == 0, "Unaligned address %p", addr);
   assert((length & (os::vm_page_size() - 1)) == 0, "Unaligned length %lx", length);
-
   if (length > 0) {
     SearchInIndex comparator;
     bool found;
-    size_t at = (size_t) _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) addr }, found);
+    int at = _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) addr }, found);
     assert(found, "Cannot find region with address %p (%d records)", addr, _index.length());
     record &r = _index.at(at);
     assert(r.length == length, "Persisted memory region length does not match at %p: %lu vs. %lu", addr, length, r.length);
@@ -865,15 +877,13 @@ void crac::MemoryPersister::finalize() {
     ::close(_fd);
     _fd = -1;
   }
-#ifdef ASSERT
   _index.sort([](struct record *a, struct record *b) {
     // simple cast to int doesn't work, let compiler figure it out with cmovs
     if (a->addr < b->addr) return -1;
     if (a->addr > b->addr) return 1;
     return 0;
   });
-  _loading = true;
-#endif // ASSERT
+  DEBUG_ONLY(_loading = true;)
   // Note: here we could persist _index and dallocate it as well but since it's
   // usually tens or hundreds of 32 byte records, we won't save much.
 }

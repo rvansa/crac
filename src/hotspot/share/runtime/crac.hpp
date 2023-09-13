@@ -30,6 +30,7 @@
 
 // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 #define UUID_LENGTH 36
+#define BAD_OFFSET 0xFFFFFFFFBAD0FF5Eull
 
 class crac: AllStatic {
 public:
@@ -79,6 +80,8 @@ public:
     static int _fd;
     static bool _loading;
     static size_t _offset_curr;
+    static int _uffd;
+    static int _profile_fd;
 
   public:
     static bool store(void *addr, size_t length, size_t mapped_length, bool executable);
@@ -86,6 +89,9 @@ public:
 
     static void finalize();
     static void load_on_restore();
+    static void init_userfault();
+    static void handle_userfault(void *addr);
+    static void *uffd_handle_loop(void *);
 #ifdef ASSERT
     static void assert_mem(void *addr, size_t used, size_t total);
     static void assert_gap(void *addr, size_t length);

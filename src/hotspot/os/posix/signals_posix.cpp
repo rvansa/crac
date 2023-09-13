@@ -556,7 +556,6 @@ int JVM_HANDLE_XXX_SIGNAL(int sig, siginfo_t* info,
                           void* ucVoid, int abort_if_unrecognized)
 {
   assert(info != nullptr && ucVoid != nullptr, "sanity");
-
   // Note: it's not uncommon that JNI code uses signal/sigset to install,
   // then restore certain signal handler (e.g. to temporarily block SIGPIPE,
   // or have a SIGILL handler when detecting CPU type). When that happens,

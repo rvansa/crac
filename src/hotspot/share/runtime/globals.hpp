@@ -2026,6 +2026,10 @@ const int ObjectAlignmentInBytes = 8;
   product(bool, CRPrintResourcesOnCheckpoint, false, DIAGNOSTIC,            \
       "Print resources to decide CheckpointException")                      \
                                                                             \
+  product(bool, CRProfileMemoryLoading, false, RESTORE_SETTABLE,            \
+      "Record the order of memory loads during boot to optimize CRaC "      \
+      "image for the next boot.")                                           \
+                                                                            \
   product(bool, CRTraceStartupTime, false, DIAGNOSTIC,                      \
       "Trace startup time")                                                 \
                                                                             \

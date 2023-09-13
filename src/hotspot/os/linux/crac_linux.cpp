@@ -36,15 +36,20 @@
 #include "logging/log.hpp"
 #include "classfile/classLoader.hpp"
 
+#include <limits.h>
 #include <linux/futex.h>
 #include <linux/rseq.h>
+#include <linux/userfaultfd.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -629,7 +634,6 @@ static void block_in_other_futex(int signal, siginfo_t *info, void *ctx) {
     // though, so we'll treat that as an error.
   }
 
-
   int dec = Atomic::sub(&persist_waiters, 1);
 #ifdef HAS_RSEQ
   if (rseqc->rseq_abi_pointer) {
@@ -767,5 +771,195 @@ void crac::after_threads_restored() {
   persist_futex = 0;
   if (syscall(SYS_futex, &persist_futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0) < 0) {
     fatal("Cannot wake up threads after restore: %s", os::strerror(errno));
+  }
+}
+
+void crac::MemoryPersister::handle_userfault(void *addr) {
+  os::write(_profile_fd, &addr, sizeof(addr));
+  ::syncfs(_profile_fd);
+
+  SearchInIndex comparator;
+  bool found; // ignored
+  int at = _index.find_sorted<struct record>(&comparator, { .addr = (u_int64_t) addr }, found);
+  if (at >= _index.length()) {
+    --at;
+  }
+  size_t page_size = os::vm_page_size();
+
+  const record &f = _index.at(at);
+  const record &r = at > 0 && addr < (void *) f.addr ? _index.at(--at) : f;
+
+  void *end = (void *) (r.addr + align_up(r.length, page_size));
+  if (addr < (void *) r.addr || addr >= end) {
+    fatal("Userfault handling address %p but closest region is %p-%p", addr, (void *) r.addr, end);
+  }
+  assert(r.flags & Flags::DATA, "Bad flags (missing DATA) for %p: 0x%x", addr, r.flags);
+  assert(r.flags & Flags::ACCESSIBLE, "Bad flags (missing ACCESSIBLE) for %p: 0x%x", addr, r.flags);
+  assert(r.offset != BAD_OFFSET, "Invalid offset at %p", addr);
+  void *begin = align_down(addr, page_size);
+  char buf[page_size];
+  size_t offset = r.offset + ((char *) begin - (char *) r.addr);
+  if (os::seek_to_file_offset(_fd, offset) == -1) {
+    fatal("lseek %zu (%zu + %zu): %s", offset, r.offset, (char *) begin - (char *) r.addr, os::strerror(errno));
+  }
+  read_all(_fd, buf, page_size);
+
+  struct uffdio_copy copy;
+  copy.src = (long long)buf;
+  copy.dst = (long long)addr;
+  copy.len = page_size;
+  copy.mode = 0;
+  if (ioctl(_uffd, UFFDIO_COPY, &copy) == -1) {
+      perror("ioctl/copy");
+      os::exit(1);
+  }
+  struct uffdio_range range;
+  range.start = (__u64) begin;
+  range.len = page_size;
+  if (ioctl(_uffd, UFFDIO_UNREGISTER, &range)) {
+    perror("ioctl/uffdio_unregister");
+    os::exit(1);
+  }
+}
+
+void *crac::MemoryPersister::uffd_handle_loop(void *) {
+  size_t page_size = os::vm_page_size();
+  for (;;) {
+      struct uffd_msg msg;
+
+      struct pollfd pollfd[1];
+      pollfd[0].fd = _uffd;
+      pollfd[0].events = POLLIN;
+
+      // wait for a userfaultfd event to occur
+      int pollres = poll(pollfd, 1, 2000);
+
+      switch (pollres) {
+      case -1:
+          perror("poll/userfaultfd");
+          continue;
+      case 0:
+          continue;
+      case 1:
+          break;
+      default:
+          fprintf(stderr, "unexpected poll result\n");
+          os::exit(1);
+      }
+
+      if (pollfd[0].revents & POLLERR) {
+          fprintf(stderr, "pollerr\n");
+          os::exit(1);
+      }
+
+      if (!pollfd[0].revents & POLLIN) {
+          continue;
+      }
+
+      int readres = read(_uffd, &msg, sizeof(msg));
+      if (readres == -1) {
+          if (errno == EAGAIN)
+              continue;
+          perror("read/userfaultfd");
+          os::exit(1);
+      }
+
+      if (readres != sizeof(msg)) {
+          fprintf(stderr, "invalid msg size\n");
+          os::exit(1);
+      }
+
+      // handle the page fault by copying a page worth of bytes
+      if (msg.event & UFFD_EVENT_PAGEFAULT) {
+          handle_userfault((void *) msg.arg.pagefault.address);
+      }
+
+  }
+  return nullptr;
+}
+
+void crac::MemoryPersister::init_userfault() {
+  struct uffdio_api uffdio_api;
+  _uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+  if (_uffd < 0) {
+    if (errno == EPERM) {
+      fprintf(stderr, "This process does not have sufficient privileges to use userfaultfd. If not running as root please write 1 to /proc/sys/vm/unprivileged_userfaultfd");
+      os::exit(1);
+    }
+    fatal("uffd: %s", os::strerror(errno));
+  }
+  uffdio_api.api = UFFD_API;
+  uffdio_api.features = 0; // UFFD_FEATURE_SIGBUS;
+  if (ioctl(_uffd, UFFDIO_API, &uffdio_api) == -1) {
+    fatal("ioctl/uffdio_api: %s", os::strerror(errno));
+  }
+  if (uffdio_api.api != UFFD_API) {
+    fatal("unsupported userfaultfd api");
+  }
+
+  // An alternative would be to create the profile in temporary file, and automatically
+  // optimize the image after boot (probably based on a timeout since last load).
+  char path[PATH_MAX];
+  snprintf(path, PATH_MAX, "%s%sload_profile.img", CRaCRestoreFrom, os::file_separator());
+  _profile_fd = os::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR|S_IWUSR);
+  if (_profile_fd < 0) {
+    fatal("Cannot open profile %s: %s", path, os::strerror(errno));
+  }
+
+  ensure_open(true);
+  size_t page_size = os::vm_page_size();
+  for (int i = 0; i < _index.length(); ++i) {
+    const struct record &r = _index.at(i);
+    size_t aligned_length = align_up(r.length, page_size);
+    int fd = _fd;
+    size_t offset = r.offset;
+    if ((r.flags & Flags::DATA) == 0) {
+      fd = -1;
+      offset = 0;
+    }
+    if (r.flags & Flags::ACCESSIBLE) {
+      if (!map((void *) r.addr, aligned_length, -1, 0, r.flags & Flags::EXECUTABLE)) {
+        fatal("Cannot map memory at %p-%p", (void *) r.addr, (void *)(r.addr + aligned_length));
+      }
+    } else {
+      if (!map_gap((void *) r.addr, aligned_length)) {
+        fatal("Cannot map non-accessible memory at %p-%p", (void *) r.addr, (void *)(r.addr + aligned_length));
+      }
+    }
+    if (r.flags & Flags::DATA) {
+      struct uffdio_register reg;
+      reg.range.start = (__u64) r.addr;
+      reg.range.len = aligned_length;
+      reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+      if (ioctl(_uffd, UFFDIO_REGISTER, &reg) == -1) {
+        fatal("ioctl/uffdio_register: %s", os::strerror(errno));
+      }
+    }
+  }
+  // The UFFD handler must use a custom stack because had we left stack allocation
+  // to glibc this would add it to an internal list of used stacks. However this list
+  // is implemented by linking from previously allocated stack, which might be yet in
+  // persisted state, and this code would self-deadlock on userfaultfd.
+  size_t stack_size = os::current_stack_size();
+  void *stack = ::mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (stack == MAP_FAILED) {
+    fatal("Cannot allocate stack for UFFD handler: %s", os::strerror(errno));
+  }
+  pthread_attr_t attrs ;
+  if (pthread_attr_init(&attrs) || pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED)) {
+    fatal("Cannot init UFFD handler attributes: %s", os::strerror(errno));
+  }
+  if (pthread_attr_setstack(&attrs, stack, stack_size)) {
+    fatal("Cannot setup UFFD handler stack: %s", os::strerror(errno));
+  }
+  pthread_t uffd_thread;
+  if (pthread_create(&uffd_thread, &attrs, uffd_handle_loop, nullptr)) {
+    fatal("Cannot start UFFD handler thread: %s", os::strerror(errno));
+  }
+  if (pthread_attr_destroy(&attrs)) {
+    perror("Cannot destroy UFFD handler attrs");
+  }
+  if (pthread_setname_np(uffd_thread, "UFFD handler")) {
+    perror("Set UFFD handler thread name");
   }
 }
