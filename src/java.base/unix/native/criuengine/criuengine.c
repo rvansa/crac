@@ -48,6 +48,10 @@
 #define SUPPRESS_ERROR_IN_PARENT 77
 
 static int create_cppath(const char *imagedir);
+static int restore(const char *basedir,
+        const char *self,
+        const char *criu,
+        const char *imagedir);
 
 static int g_pid;
 
@@ -219,6 +223,53 @@ static int checkpoint(pid_t jvm,
     }
 
     create_cppath(imagedir);
+
+    // This is used for auto-optimization of the checkpoint image
+    char* restore_after_checkpoint = getenv("CRAC_RESTORE_AFTER_CHECKPOINT");
+    if (restore_after_checkpoint) {
+        // This process is still a member of the process group of the original
+        // (killed) java process; clone3 would fail with EEXIST as the java PID
+        // is used as PGID.
+        // We cannot just setpgid(0, 0) - for some reason this would get the shell
+        // that started the original java process exit(137) when the restored process
+        // terminates. Instead we'll start our own session and create a new process group
+        // through that.
+        if (setsid() < 0) {
+            perror("Cannot become session leader");
+        }
+        pid_t child = fork();
+        if (child == 0) {
+            restore(basedir, self, criu, imagedir);
+            exit(1); // should not reach here
+        } else {
+            int status;
+            if (waitpid(child, &status, 0) != child) {
+                perror("wait for criu");
+            } else {
+                if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0)) {
+                    fprintf(stderr, "CRIU failed to restore the process for optimization.\n");
+                    // the wrapper process is waiting for the restored optimizer to open
+                    // opt.fifo in the checkpoint directory; we need to unblock it when restore
+                    // won't happen.
+                    int dirfd = open(imagedir, O_RDONLY | O_DIRECTORY);
+                    if (dirfd < 0) {
+                        perror("Cannot open checkpoint directory");
+                    }
+                    const char *opt_fifo = "opt.fifo";
+                    if (mkfifoat(dirfd, opt_fifo, 0600) && errno != EEXIST) {
+                        perror("Cannot create fifo for synchronization of optimization");
+                    }
+                    int fifo_fd = openat(dirfd, opt_fifo, O_WRONLY);
+                    if (fifo_fd < 0) {
+                        perror("Cannot open (write) fifo used for synchronization of optimization");
+                    } else {
+                        close(fifo_fd);
+                    }
+                }
+            }
+        }
+    }
+
     exit(0);
 }
 

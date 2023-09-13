@@ -218,6 +218,15 @@ static int call_crengine() {
 static int checkpoint_restore(int *shmid) {
   crac::record_time_before_checkpoint();
 
+#ifdef LINUX
+  // The process cannot be restored until its process group terminates;
+  // if we have a parent wrapper process (ppid = pgid) we need to become
+  // leader of own process group before checkpoint.
+  if (setpgid(0, 0)) {
+    warning("Cannot become own process group: %s", os::strerror(errno));
+  }
+#endif
+
   int cres = call_crengine();
   if (cres < 0) {
     tty->print_cr("CRaC error executing: %s\n", _crengine);
@@ -408,10 +417,23 @@ void VM_Crac::doit() {
       // we must not use it from now on
       persist_thread_stacks();
       crac::MemoryPersister::finalize();
+      bool auto_optimize = strcmp(CRPersistMemoryCompression, "disabled");
+      if (CRAutoOptimizeMemory != nullptr) {
+        auto_optimize = !strcmp(CRAutoOptimizeMemory, "enabled");
+      }
+      if (auto_optimize) {
+        size_t cr_len = strlen(CRaCCheckpointTo) + strlen("CRaCRestoreFrom=") + 1;
+        char buf[cr_len];
+        snprintf(buf, cr_len, "CRaCRestoreFrom=%s", CRaCCheckpointTo);
+        const char *optimize_flags[2] = { buf, "+CROptimizeMemoryNow" };
+        crac::setup_restore_parameters(optimize_flags, 2, nullptr, "");
+        LINUX_ONLY(setenv("CRAC_RESTORE_AFTER_CHECKPOINT", "true", true));
+      }
     }
     int ret = checkpoint_restore(&shmid);
     if (ret == JVM_CHECKPOINT_ERROR) {
       if (CRPersistMemory) {
+        crac::MemoryPersister::load_index();
         crac::MemoryPersister::load_on_restore();
         restore_thread_stacks();
       }
@@ -431,6 +453,7 @@ void VM_Crac::doit() {
   }
 
   if (CRPersistMemory) {
+    crac::MemoryPersister::load_index();
 #ifdef ASSERT
     CodeCache::assert_checkpoint();
     Universe::heap()->on_restore();
@@ -443,7 +466,14 @@ void VM_Crac::doit() {
       vsn->assert_checkpoint();
     }
 #endif // ASSERT
-    crac::MemoryPersister::load_on_restore();
+    if (CROptimizeMemoryNow) {
+      tty->print_cr("Restored with profiling for memory optimization...");
+      crac::MemoryPersister::init_userfault(true);
+    } else if (CRRestoreMemoryNoWait) {
+        crac::MemoryPersister::init_userfault(false);
+    } else {
+      crac::MemoryPersister::load_on_restore();
+    }
     restore_thread_stacks();
   }
   // VM_Crac::read_shm needs to be already called to read RESTORE_SETTABLE parameters.
@@ -554,30 +584,34 @@ Handle crac::checkpoint(jarray fd_arr, jobjectArray obj_arr, bool dry_run, jlong
   return ret_cr(JVM_CHECKPOINT_ERROR, Handle(), Handle(), codes, msgs, THREAD);
 }
 
-void crac::restore() {
+void crac::setup_restore_parameters(
+      const char* const* flags, int num_flags,
+      const SystemProperty* props,
+      const char *args) {
   jlong restore_time = os::javaTimeMillis();
   jlong restore_nanos = os::javaTimeNanos();
 
-  compute_crengine();
-
   const int id = os::current_process_id();
-
   CracSHM shm(id);
   int shmfd = shm.open(O_RDWR | O_CREAT);
   if (0 <= shmfd) {
     if (CracRestoreParameters::write_to(
-          shmfd,
-          Arguments::jvm_flags_array(), Arguments::num_jvm_flags(),
-          Arguments::system_properties(),
-          Arguments::java_command() ? Arguments::java_command() : "",
-          restore_time,
-          restore_nanos)) {
+          shmfd, flags, num_flags, props, args,
+          restore_time, restore_nanos)) {
       char strid[32];
       snprintf(strid, sizeof(strid), "%d", id);
       LINUX_ONLY(setenv("CRAC_NEW_ARGS_ID", strid, true));
     }
     close(shmfd);
   }
+}
+
+void crac::restore() {
+  compute_crengine();
+  setup_restore_parameters(
+    Arguments::jvm_flags_array(), Arguments::num_jvm_flags(),
+    Arguments::system_properties(),
+    Arguments::java_command() ? Arguments::java_command() : "");
 
   if (_crengine) {
     _crengine_args[1] = "restore";
@@ -692,4 +726,21 @@ void crac::update_javaTimeNanos_offset() {
       javaTimeNanos_offset -= diff;
     }
   }
+}
+
+bool crac::read_all(int fd, char *dest, size_t n) {
+  size_t rd = 0;
+  do {
+    ssize_t r = ::read(fd, dest + rd, n - rd);
+    if (r == 0) {
+      return false;
+    } else if (r < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    rd += r;
+  } while (rd < n);
+  return true;
 }

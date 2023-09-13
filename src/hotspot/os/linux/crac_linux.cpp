@@ -29,6 +29,7 @@
 #include "perfMemory_linux.hpp"
 #include "runtime/crac_structs.hpp"
 #include "runtime/crac.hpp"
+#include "runtime/nonJavaThread.hpp"
 #include "runtime/os.hpp"
 #include "runtime/osThread.hpp"
 #include "runtime/threads.hpp"
@@ -36,15 +37,20 @@
 #include "logging/log.hpp"
 #include "classfile/classLoader.hpp"
 
+#include <limits.h>
 #include <linux/futex.h>
 #include <linux/rseq.h>
+#include <linux/userfaultfd.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -313,6 +319,10 @@ bool VM_Crac::check_fds() {
 
   bool ok = true;
 
+  char lib_path[JVM_MAXPATHLEN];
+  const char *file_sep = os::file_separator();
+  size_t lib_path_len = jio_snprintf(lib_path, JVM_MAXPATHLEN, "%s%slib%s", Arguments::get_java_home(), file_sep, file_sep);
+
   for (int i = 0; i < fds.len(); ++i) {
     if (fds.get_state(i) == FdsInfo::CLOSED) {
       continue;
@@ -341,6 +351,11 @@ bool VM_Crac::check_fds() {
         print_resources("OK: jcmd socket\n");
         continue;
       }
+    }
+
+    if (!strncmp(lib_path, details, lib_path_len) && !strcmp(".so", details + strlen(details) - 3)) {
+      print_resources("OK: JVM dynamic library\n");
+      continue;
     }
 
     print_resources("BAD: opened by application\n");
@@ -475,23 +490,6 @@ void crac::vm_create_start() {
   _vm_inited_fds.initialize();
 }
 
-static bool read_all(int fd, char *dest, size_t n) {
-  size_t rd = 0;
-  do {
-    ssize_t r = ::read(fd, dest + rd, n - rd);
-    if (r == 0) {
-      return false;
-    } else if (r < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return false;
-    }
-    rd += r;
-  } while (rd < n);
-  return true;
-}
-
 bool crac::read_bootid(char *dest) {
   int fd = ::open("/proc/sys/kernel/random/boot_id", O_RDONLY);
   if (fd < 0 || !read_all(fd, dest, UUID_LENGTH)) {
@@ -534,6 +532,20 @@ bool crac::MemoryPersister::map_gap(void *addr, size_t length) {
   if (::mmap(addr, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != addr) {
     perror("::mmap NONE");
     return false;
+  }
+  return true;
+}
+
+bool crac::MemoryPersister::copy(void *dest, const void *src, size_t length) {
+  struct uffdio_copy copy;
+  copy.dst = (__u64) dest;
+  copy.src = (__u64) src;
+  copy.len = (__u64) length;
+  copy.mode = 0;
+  while (ioctl(_uffd, UFFDIO_COPY, &copy)) {
+    if (errno != EAGAIN) {
+      return false;
+    }
   }
   return true;
 }
@@ -762,5 +774,231 @@ void crac::after_threads_restored() {
   persist_futex = 0;
   if (syscall(SYS_futex, &persist_futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0) < 0) {
     fatal("Cannot wake up threads after restore: %s", os::strerror(errno));
+  }
+}
+
+void crac::MemoryPersister::handle_userfault(void *addr, MemoryReader *reader) {
+  // _load_profile is nulled by this very thread, so no need to synchronize
+  if (_load_profile != nullptr) {
+    _load_profile->append(addr);
+  }
+
+  const struct record &r = find_record(addr);
+  const size_t page_size = os::vm_page_size();
+  void *begin = align_down(addr, page_size);
+  char buf[page_size];
+  reader->read(r.offset + ((char *) begin - (char *) r.addr), buf, page_size, false);
+
+  struct uffdio_copy copy;
+  copy.src = (long long)buf;
+  copy.dst = (long long)addr;
+  copy.len = page_size;
+  copy.mode = 0;
+  if (ioctl(_uffd, UFFDIO_COPY, &copy) == -1) {
+      fatal("ioctl/copy: %s", os::strerror(errno));
+  }
+
+  struct uffdio_range range;
+  range.start = (__u64) begin;
+  range.len = page_size;
+  if (ioctl(_uffd, UFFDIO_UNREGISTER, &range)) {
+    fatal("ioctl/uffdio_unregister: %s", os::strerror(errno));
+  }
+}
+
+static void *call_run(void *);
+
+class CustomStackThread: public NonJavaThread {
+const char *_name;
+public:
+  CustomStackThread(const char *name): _name(name) {
+    OSThread* osthread = new (std::nothrow) OSThread();
+    if (osthread == nullptr) {
+      fatal("Cannot create OSThread");
+    }
+    osthread->set_thread_type(os::vm_thread);
+    // Initial state is ALLOCATED but not INITIALIZED
+    osthread->set_state(ALLOCATED);
+
+    set_osthread(osthread);
+
+    // The UFFD handler must use a custom stack because had we left stack allocation
+    // to glibc this would add it to an internal list of used stacks. However this list
+    // is implemented by linking from previously allocated stack, which might be yet in
+    // persisted state, and this code would self-deadlock on userfaultfd.
+    size_t stack_size = os::current_stack_size();
+    void *stack = ::mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) {
+      fatal("Cannot allocate stack for %s: %s", name, os::strerror(errno));
+    }
+    pthread_attr_t attrs ;
+    if (pthread_attr_init(&attrs) || pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED)) {
+      fatal("Cannot init %s attributes: %s", name, os::strerror(errno));
+    }
+    if (pthread_attr_setstack(&attrs, stack, stack_size)) {
+      fatal("Cannot setup %s stack: %s", name, os::strerror(errno));
+    }
+    pthread_t tid;
+    if (pthread_create(&tid, &attrs, ::call_run, this)) {
+      fatal("Cannot start %s thread: %s", name, os::strerror(errno));
+    }
+    if (pthread_attr_destroy(&attrs)) {
+      tty->print_cr("Cannot destroy %s attrs: %s", name, os::strerror(errno));
+    }
+
+    osthread->set_thread_id(tid);
+  }
+
+  const char *name() const override {
+    return _name;
+  }
+};
+
+static void check_idle_time(struct timespec *before) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long diff = (now.tv_sec - before->tv_sec) * 1000 + (now.tv_nsec - before->tv_nsec) / 1000000 ;
+  if (diff > CROptimizeMemoryIdleTimeout) {
+    crac::MemoryPersister::optimize();
+    os::exit(0);
+  }
+}
+
+class UserfaultFdHandler: public CustomStackThread {
+private:
+  int _uffd;
+public:
+  UserfaultFdHandler(int uffd): CustomStackThread("UFFD handler"), _uffd(uffd) {
+  }
+
+  void run() override {
+    size_t page_size = os::vm_page_size();
+    crac::FileMemoryReader reader(crac::MemoryPersister::MEMORY_IMG);
+    for (;;) {
+        struct uffd_msg msg;
+
+        struct pollfd pollfd[1];
+        pollfd[0].fd = _uffd;
+        pollfd[0].events = POLLIN;
+
+        struct timespec before_poll;
+        clock_gettime(CLOCK_MONOTONIC, &before_poll);
+        // wait for a userfaultfd event to occur
+        int pollres = poll(pollfd, 1, CROptimizeMemoryIdleTimeout);
+
+        switch (pollres) {
+        case -1:
+            perror("poll/userfaultfd");
+            continue;
+        case 0:
+            check_idle_time(&before_poll);
+            continue;
+        case 1:
+            break;
+        default:
+            fatal("unexpected poll result: %d", pollres);
+        }
+
+        if (pollfd[0].revents & POLLERR) {
+            fatal("pollerr");
+        }
+
+        if (!pollfd[0].revents & POLLIN) {
+            continue;
+        }
+
+        int readres = read(_uffd, &msg, sizeof(msg));
+        if (readres == -1) {
+            if (errno == EAGAIN)
+                continue;
+            fatal("read/userfaultfd: %s", os::strerror(errno));
+        }
+
+        if (readres != sizeof(msg)) {
+            fatal("invalid msg size %d\n", readres);
+        }
+
+        // handle the page fault by copying a page worth of bytes
+        if (msg.event & UFFD_EVENT_PAGEFAULT) {
+            crac::MemoryPersister::handle_userfault((void *) msg.arg.pagefault.address, &reader);
+        }
+    }
+  }
+};
+
+// This is used with CRRestoreMemoryNoWait
+class LoaderThread: public CustomStackThread {
+public:
+  LoaderThread(): CustomStackThread("PM loader") {}
+
+  void run() override {
+    crac::MemoryPersister::load_on_restore();
+  }
+
+  void post_run() override {
+    NonJavaThread::post_run();
+    initialize_thread_current();
+    delete this;
+  }
+};
+
+static void *call_run(void *t) {
+  CustomStackThread *thread = (CustomStackThread *)t;
+  thread->record_stack_base_and_size();
+  thread->initialize_thread_current();
+  thread->set_native_thread_name(thread->name());
+  thread->call_run();
+  return nullptr;
+}
+
+void crac::MemoryPersister::init_userfault(bool lazy_loading) {
+  struct uffdio_api uffdio_api;
+  _uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+  if (_uffd < 0) {
+    if (errno == EPERM) {
+      fprintf(stderr, "This process does not have sufficient privileges to use userfaultfd. If not running as root please write 1 to /proc/sys/vm/unprivileged_userfaultfd");
+      os::exit(1);
+    }
+    fatal("uffd: %s", os::strerror(errno));
+  }
+  uffdio_api.api = UFFD_API;
+  uffdio_api.features = 0; // UFFD_FEATURE_SIGBUS;
+  if (ioctl(_uffd, UFFDIO_API, &uffdio_api) == -1) {
+    fatal("ioctl/uffdio_api: %s", os::strerror(errno));
+  }
+  if (uffdio_api.api != UFFD_API) {
+    fatal("unsupported userfaultfd api");
+  }
+
+  size_t page_size = os::vm_page_size();
+  for (int i = 0; i < _index.length(); ++i) {
+    const struct record &r = _index.at(i);
+    size_t aligned_length = align_up(r.length, page_size);
+    if (r.flags & Flags::ACCESSIBLE) {
+      if (!map((void *) r.addr, aligned_length, r.flags & Flags::EXECUTABLE)) {
+        fatal("Cannot map memory at %p-%p", (void *) r.addr, (void *)(r.addr + aligned_length));
+      }
+    } else {
+      if (!map_gap((void *) r.addr, aligned_length)) {
+        fatal("Cannot map non-accessible memory at %p-%p", (void *) r.addr, (void *)(r.addr + aligned_length));
+      }
+    }
+    if (r.flags & Flags::DATA) {
+      struct uffdio_register reg;
+      reg.range.start = (__u64) r.addr;
+      reg.range.len = aligned_length;
+      reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+      if (ioctl(_uffd, UFFDIO_REGISTER, &reg) == -1) {
+        fatal("ioctl/uffdio_register: %s", os::strerror(errno));
+      }
+    }
+  }
+  if (lazy_loading) {
+    _load_profile = new (mtInternal) GrowableArray<const void *>(4096, mtInternal);
+    // The thread instance is going to live until VM exits (no delete)
+    new UserfaultFdHandler(_uffd);
+  } else {
+    // LoaderThread is detached, will delete self before terminate
+    new LoaderThread();
   }
 }

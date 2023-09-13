@@ -34,8 +34,12 @@
 #include "jli_util.h"
 #include "jni.h"
 
+#include <stdbool.h>
 #ifndef WIN32
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #endif
 #ifdef LINUX
 #include <syscall.h>
@@ -65,9 +69,12 @@ WinMain(HINSTANCE inst, HINSTANCE previnst, LPSTR cmdline, int cmdshow)
 #include <sys/wait.h>
 
 static int is_checkpoint = 0;
+static const char *checkpoint_dir = NULL;
 static const int crac_min_pid_default = 128;
 static int crac_min_pid = 0;
 static int is_min_pid_set = 0;
+static int is_auto_optimize_memory = -1;
+static bool is_compress_memory = false;
 
 static void parse_checkpoint(const char *arg) {
     if (!is_checkpoint) {
@@ -75,6 +82,17 @@ static void parse_checkpoint(const char *arg) {
         const int len = strlen(checkpoint_arg);
         if (0 == strncmp(arg, checkpoint_arg, len)) {
             is_checkpoint = 1;
+            checkpoint_dir = arg + len + 1;
+        }
+    }
+    const char auto_optimize_opt[] = "-XX:CRAutoOptimizeMemory=";
+    const char compression_opt[] = "-XX:CRPersistMemoryCompression=";
+    if (!strncmp(arg, auto_optimize_opt, strlen(auto_optimize_opt))) {
+        is_auto_optimize_memory = !strcmp(arg + strlen(auto_optimize_opt), "enabled");
+    } else if (!strncmp(arg, compression_opt, strlen(compression_opt))) {
+        is_compress_memory = strcmp(arg + strlen(compression_opt), "disabled");
+        if (is_compress_memory && is_auto_optimize_memory < 0) {
+            is_auto_optimize_memory = 1;
         }
     }
     if (!is_min_pid_set) {
@@ -89,7 +107,7 @@ static void parse_checkpoint(const char *arg) {
 
 static pid_t g_child_pid = -1;
 
-static int wait_for_children() {
+static int wait_for_children(int *sig) {
     int status = -1;
     pid_t pid;
     do {
@@ -105,14 +123,10 @@ static int wait_for_children() {
     }
 
     if (WIFSIGNALED(status)) {
-        // Try to terminate the current process with the same signal
-        // as the child process was terminated
-        const int sig = WTERMSIG(status);
-        signal(sig, SIG_DFL);
-        raise(sig);
-        // Signal was ignored, return 128+n as bash does
+        *sig = WTERMSIG(status);
+        // In case the signal is ignored return 128+n as bash does
         // see https://linux.die.net/man/1/bash
-        return 128+sig;
+        return 128 + *sig;
     }
 
     return 1;
@@ -319,7 +333,7 @@ main(int argc, char **argv)
         crac_min_pid = crac_min_pid_default;
     }
     const int needs_pid_adjust = getpid() < crac_min_pid;
-    if (is_checkpoint && (is_init || needs_pid_adjust)) {
+    if (is_checkpoint && (is_init || needs_pid_adjust || is_auto_optimize_memory > 0)) {
         // Move PID value for new processes to a desired value
         // to avoid PID conflicts on restore.
         if (needs_pid_adjust) {
@@ -349,7 +363,35 @@ main(int argc, char **argv)
         if (0 < g_child_pid) {
             // The main process should forward signals to the child.
             setup_sighandler();
-            const int status = wait_for_children();
+            int sig = -1;
+            const int status = wait_for_children(&sig);
+            if (sig == SIGKILL && is_auto_optimize_memory > 0) {
+                int dirfd = open(checkpoint_dir, O_RDONLY | O_DIRECTORY);
+                if (dirfd < 0) {
+                    perror("Cannot open checkpoint directory");
+                }
+                // This will synchronize this process and the restored optimizer
+                const char *opt_fifo = "opt.fifo";
+                if (mkfifoat(dirfd, opt_fifo, 0600) && errno != EEXIST) {
+                    perror("Cannot create fifo for synchronization of optimization");
+                }
+                int fifo_fd = openat(dirfd, opt_fifo, O_RDONLY);
+                if (fifo_fd < 0) {
+                    perror("Cannot open (read) fifo used for synchronization of optimization");
+                } else {
+                    close(fifo_fd);
+                    if (unlinkat(dirfd, opt_fifo, 0)) {
+                        perror("Cannot remove fifo used for synchronization of optimization");
+                    }
+                }
+                close(dirfd);
+            }
+            if (sig >= 0) {
+                // Try to terminate the current process with the same signal
+                // as the child process was terminated
+                signal(sig, SIG_DFL);
+                raise(sig);
+            }
             exit(status);
         }
     }

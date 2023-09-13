@@ -25,6 +25,7 @@
 #define SHARE_RUNTIME_CRAC_HPP
 
 #include "memory/allStatic.hpp"
+#include "runtime/arguments.hpp"
 #include "runtime/handles.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
@@ -39,6 +40,8 @@ public:
   static bool prepare_checkpoint();
   static Handle checkpoint(jarray fd_arr, jobjectArray obj_arr, bool dry_run, jlong jcmd_stream, TRAPS);
   static void restore();
+  static void setup_restore_parameters(const char* const* flags, int num_flags,
+      const SystemProperty* props, const char *args);
 
   static jlong restore_start_time();
   static jlong uptime_since_restore();
@@ -85,6 +88,12 @@ public:
     void read(size_t offset, void *addr, size_t size, bool executable) override;
   };
 
+  class FileMemoryReader: public crac::MemoryReader {
+  public:
+    FileMemoryReader(const char *filename): MemoryReader(filename) {}
+    void read(size_t offset, void *addr, size_t size, bool executable) override;
+  };
+
   class MemoryPersister: AllStatic {
   protected:
     enum Flags {
@@ -112,17 +121,25 @@ public:
     static void allocate_index(size_t slots);
 
     static GrowableArray<struct crac::MemoryPersister::record> _index;
+    static int _uffd;
+    static GrowableArray<const void *> *_load_profile;
     static MemoryWriter *_writer;
+    static bool _is_compressed;
 
   public:
     static constexpr char MEMORY_IMG[] = "memory.img";
+    static constexpr char MEMORY_INDEX[] = "memory.index";
 
     static void init();
     static bool store(void *addr, size_t length, size_t mapped_length, bool executable);
     static bool store_gap(void *addr, size_t length);
 
     static void finalize();
+    static void load_index();
     static void load_on_restore();
+    static void init_userfault(bool lazy_loading);
+    static void handle_userfault(void *addr, MemoryReader *reader);
+    static void optimize();
 #ifdef ASSERT
     static void assert_mem(void *addr, size_t used, size_t total);
     static void assert_gap(void *addr, size_t length);
@@ -131,12 +148,21 @@ public:
     static bool unmap(void *addr, size_t length);
     static bool map(void *addr, size_t length, bool executable);
     static bool map_gap(void *addr, size_t length);
+    static bool copy(void *dest, const void *src, size_t length);
+
+    static void persist_index(GrowableArray<struct record> &index);
+
+    static const struct record &find_record(const void *addr);
+    static void add_record_to_new_index(const char *from, const char *to,
+      MemoryReader &reader, const struct record &old,
+      MemoryWriter *writer, GrowableArray<struct record> &new_index);
   };
 
   static void before_threads_persisted();
   static void after_threads_restored();
 
 private:
+  static bool read_all(int fd, char *buf, size_t bytes);
   static bool read_bootid(char *dest);
 
   static jlong checkpoint_millis;

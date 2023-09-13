@@ -2020,8 +2020,30 @@ const int ObjectAlignmentInBytes = 8;
       "Dump heap on CheckpointException thrown because of CRaC "            \
       "precondition failed")                                                \
                                                                             \
+  product(ccstr, CRAutoOptimizeMemory, nullptr, "Performs a restore "       \
+      "immediately after a successful checkpoint, tracking memory loads. "  \
+      "Persisted memory is then optimized for this order of loads. "        \
+      "Available values are 'enabled' and 'disabled'. By default the "      \
+      "auto-optimization is enabled only if CRPersistMemoryCompression is " \
+      "enabled.")        \
+                                                                            \
+  product(int, CROptimizeMemoryIdleTimeout, 1000, "Timeout for detecting "  \
+      "restored process being idle, in milliseconds.")                      \
+                                                                            \
+  product(bool, CROptimizeMemoryNow, false, RESTORE_SETTABLE,               \
+      "Track memory loads and optimize persisted memory file. This option " \
+      "is usually set through -XX:+CRAutoOptimizeMemory")                   \
+                                                                            \
   product(bool, CRPersistMemory, true, DIAGNOSTIC, "Persist/load memory "   \
       "from within the VM rather than relying on the C/R engine.")          \
+                                                                            \
+  product(ccstr, CRPersistMemoryCompression, "disabled",                    \
+      "Compress persisted memory. Set to 'enabled' for default "            \
+      "compression, value 1..9 to set compression level or 'disabled' for " \
+      " no compression.")                                                   \
+                                                                            \
+  product(bool, CRRestoreMemoryNoWait, false, RESTORE_SETTABLE, "Continue " \
+      "after restore without waiting for persisted memory to be restored.") \
                                                                             \
   product(bool, CRPrintResourcesOnCheckpoint, false, DIAGNOSTIC,            \
       "Print resources to decide CheckpointException")                      \
