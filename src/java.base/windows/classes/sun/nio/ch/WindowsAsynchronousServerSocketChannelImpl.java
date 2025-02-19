@@ -53,7 +53,7 @@ class WindowsAsynchronousServerSocketChannelImpl
     // operations complete immediately and handled by the initiating thread.
     // The corresponding OVERLAPPED cannot be reused/released until the completion
     // event has been posted.
-    private final PendingIoCache ioCache;
+    private PendingIoCache ioCache;
 
     // the data buffer to receive the local/remote socket address
     private final long dataBuffer;
@@ -105,14 +105,13 @@ class WindowsAsynchronousServerSocketChannelImpl
     @Override
     protected void implReopen() throws IOException {
         handle = IOUtil.fdVal(fd);
-        int key;
+        ioCache = new PendingIoCache();
         try {
-            key = iocp.associate(this, handle);
+            completionKey = iocp.associate(this, handle);
         } catch (IOException x) {
             closesocket0(handle);
             throw x;
         }
-        this.completionKey = key;
     }
 
     @Override
