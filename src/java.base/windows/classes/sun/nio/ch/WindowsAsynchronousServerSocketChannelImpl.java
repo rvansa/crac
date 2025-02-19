@@ -44,8 +44,8 @@ class WindowsAsynchronousServerSocketChannelImpl
     // 2 * (sizeof(SOCKET_ADDRESS) + 16)
     private static final int DATA_BUFFER_SIZE = 88;
 
-    private final long handle;
-    private final int completionKey;
+    private long handle;
+    private int completionKey;
     private final Iocp iocp;
 
     // typically there will be zero, or one I/O operations pending. In rare
@@ -100,6 +100,19 @@ class WindowsAsynchronousServerSocketChannelImpl
 
         // release other resources
         unsafe.freeMemory(dataBuffer);
+    }
+
+    @Override
+    protected void implReopen() throws IOException {
+        handle = IOUtil.fdVal(fd);
+        int key;
+        try {
+            key = iocp.associate(this, handle);
+        } catch (IOException x) {
+            closesocket0(handle);
+            throw x;
+        }
+        this.completionKey = key;
     }
 
     @Override
