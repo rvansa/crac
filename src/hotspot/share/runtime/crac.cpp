@@ -223,18 +223,13 @@ bool crac::interpolate_checkpoint_location(char *buf, size_t buflen, bool *fixed
       }
       break;
     case 'u': { // Random UUID (v4)
-        u4 uuid[4];
-        if (!random_bytes(reinterpret_cast<u1 *>(uuid), sizeof(uuid))) {
-          log_error(crac)("Cannot generate random UUID");
-          return false;
-        }
         check_no_width_padding();
         *fixed = false; // FIXME?
-        u4 time_mid_high = uuid[0];
-        u4 seq_and_node_low = uuid[1];
+        u4 time_mid_high = static_cast<u4>(os::random());
+        u4 seq_and_node_low = static_cast<u4>(os::random());
         check_retval(snprintf(buf, buflen, "%08x-%04x-4%03x-%04x-%04x%08x",
-          uuid[2], time_mid_high >> 16, time_mid_high & 0xFFF,
-          0x8000 | (seq_and_node_low & 0x3FFF), seq_and_node_low >> 16, uuid[3]));
+          static_cast<u4>(os::random()), time_mid_high >> 16, time_mid_high & 0xFFF,
+          0x8000 | (seq_and_node_low & 0x3FFF), seq_and_node_low >> 16, static_cast<u4>(os::random())));
       }
       break;
     case 't': // checkpoint (current) time
